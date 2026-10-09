@@ -1,6 +1,6 @@
 --- a/dlls/winex11.drv/init.c
 +++ b/dlls/winex11.drv/init.c
-@@ -822,6 +822,90 @@
+@@ -822,6 +822,112 @@
  #endif
  }
  
@@ -28,6 +28,12 @@
 +static Damage (*pXDamageCreate)( Display *display, Drawable drawable, int level );
 +static void (*pXDamageSubtract)( Display *display, Damage damage, XID repair, XID parts );
 +
++/* errors on the private damage connection are expected (window destroyed under us), never fatal */
++static int damage_error_callback( Display *display, XErrorEvent *event, void *arg )
++{
++    return 1;
++}
++
 +/* the driver presents asynchronously, wait until the new frame lands in the child window before copying it */
 +static void wait_present_damage( Window window )
 +{
@@ -53,9 +59,15 @@
 +    {
 +        for (i = 0; i < ARRAY_SIZE(slots); i++) if (!slots[i].window) { slot = i; break; }
 +        if (slot < 0) return;
-+        slots[slot].window = window;
++        X11DRV_expect_error( damage_display, damage_error_callback, NULL );
++        XSelectInput( damage_display, window, StructureNotifyMask );
 +        pXDamageCreate( damage_display, window, 3 /* XDamageReportNonEmpty */ );
 +        XSync( damage_display, False );
++        if (!X11DRV_check_error())
++        {
++            slots[slot].window = window;
++            slots[slot].pending = FALSE;
++        }
 +        return;
 +    }
 +    slots[slot].pending = TRUE;
@@ -63,20 +75,30 @@
 +    clock_gettime( CLOCK_MONOTONIC, &start );
 +    for (;;)
 +    {
++        X11DRV_expect_error( damage_display, damage_error_callback, NULL );
 +        while (XPending( damage_display ))
 +        {
 +            XEvent event;
 +            XNextEvent( damage_display, &event );
++            if (event.type == DestroyNotify)
++            {
++                /* the server frees the damage with the window, forget the slot */
++                for (i = 0; i < ARRAY_SIZE(slots); i++)
++                    if (slots[i].window == event.xdestroywindow.window) slots[i].window = 0;
++                continue;
++            }
 +            if (event.type != damage_event /* + XDamageNotify */) continue;
 +            for (i = 0; i < ARRAY_SIZE(slots); i++)
 +            {
 +                XDamageNotifyEvent *notify = (XDamageNotifyEvent *)&event;
-+                if (slots[i].window != notify->drawable) continue;
++                if (!slots[i].window || slots[i].window != notify->drawable) continue;
 +                slots[i].pending = FALSE;
 +                pXDamageSubtract( damage_display, notify->damage, None, None );
 +            }
 +        }
-+        if (!slots[slot].pending) break;
++        XSync( damage_display, False );
++        X11DRV_check_error();
++        if (slots[slot].window != window || !slots[slot].pending) break;
 +        clock_gettime( CLOCK_MONOTONIC, &now );
 +        remaining = 100 - ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
 +        if (remaining <= 0) { slots[slot].pending = FALSE; break; }
@@ -91,7 +113,7 @@
  static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
  {
      struct x11drv_client_surface *surface = impl_from_client_surface( client );
-@@ -887,6 +971,7 @@
+@@ -887,6 +993,7 @@
          set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
      if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
  
